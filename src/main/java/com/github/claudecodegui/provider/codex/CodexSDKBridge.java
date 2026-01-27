@@ -216,7 +216,7 @@ public class CodexSDKBridge extends BaseSDKBridge {
      * Send message to Codex (streaming response).
      *
      * Note: Codex uses threadId instead of sessionId
-     * Note: Codex does not support attachments
+     * Note: Codex supports image attachments only (non-image attachments are sent as text hints)
      * Note: Codex does not support system prompts, so agentPrompt is appended to user message
      */
     public CompletableFuture<SDKResult> sendMessage(
@@ -224,7 +224,7 @@ public class CodexSDKBridge extends BaseSDKBridge {
             String message,
             String threadId,  // Codex uses threadId, not sessionId
             String cwd,
-            List<ClaudeSession.Attachment> attachments,  // Ignored for Codex
+            List<ClaudeSession.Attachment> attachments,  // Image attachments supported; non-image sent as hints
             String permissionMode,
             String model,
             String agentPrompt,  // Agent prompt (appended to message for Codex)
@@ -271,6 +271,20 @@ public class CodexSDKBridge extends BaseSDKBridge {
                 // API configuration
                 stdinInput.addProperty("baseUrl", baseUrl != null ? baseUrl : "");
                 stdinInput.addProperty("apiKey", apiKey != null ? apiKey : "");
+                if (attachments != null && !attachments.isEmpty()) {
+                    JsonArray attachmentArray = new JsonArray();
+                    for (ClaudeSession.Attachment att : attachments) {
+                        if (att == null) continue;
+                        JsonObject obj = new JsonObject();
+                        obj.addProperty("fileName", att.fileName);
+                        obj.addProperty("mediaType", att.mediaType);
+                        obj.addProperty("data", att.data);
+                        attachmentArray.add(obj);
+                    }
+                    if (attachmentArray.size() > 0) {
+                        stdinInput.add("attachments", attachmentArray);
+                    }
+                }
                 String stdinJson = gson.toJson(stdinInput);
 
                 List<String> command = new ArrayList<>();

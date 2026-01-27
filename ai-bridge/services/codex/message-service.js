@@ -8,7 +8,7 @@
  * - Uses threadId instead of sessionId
  * - Permission model: skipGitRepoCheck + sandbox (not permissionMode string)
  * - Events: thread.*, turn.*, item.* (not system/assistant/user/result)
- * - No attachments support (text-only)
+ * - Attachments: images passed as local_image inputs, non-images saved to temp files and referenced by path
  *
  * @author Crafted with geek spirit
  */
@@ -17,9 +17,9 @@
 import { loadCodexSdk, isCodexSdkAvailable } from '../../utils/sdk-loader.js';
 import { CodexPermissionMapper } from '../../utils/permission-mapper.js';
 import { randomUUID } from 'crypto';
-import { existsSync, readFileSync, statSync } from 'fs';
+import { existsSync, readFileSync, statSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join, dirname } from 'path';
-import { homedir } from 'os';
+import { homedir, tmpdir } from 'os';
 
 // SDK 缓存
 let codexSdk = null;
@@ -79,6 +79,7 @@ async function ensureCodexSdk() {
 }
 
 const MAX_TOOL_RESULT_CHARS = 20000;
+const IMAGE_MEDIA_PREFIX = 'image/';
 
 // AGENTS.md 最大读取字节数 (32KB，与 Codex CLI 一致)
 const MAX_AGENTS_MD_BYTES = 32 * 1024;
@@ -229,6 +230,143 @@ function collectAgentsInstructions(cwd) {
   return instructions.join('\n\n---\n\n');
 }
 
+function getAttachmentName(att) {
+  if (!att || typeof att !== 'object') return 'Attachment';
+  const name = typeof att.fileName === 'string' ? att.fileName.trim() : '';
+  return name || 'Attachment';
+}
+
+function getAttachmentExtension(att) {
+  const name = typeof att?.fileName === 'string' ? att.fileName : '';
+  const nameMatch = name.match(/\.([a-zA-Z0-9]+)$/);
+  if (nameMatch) {
+    return nameMatch[1].toLowerCase();
+  }
+  const mediaType = typeof att?.mediaType === 'string' ? att.mediaType : '';
+  if (!mediaType.includes('/')) return '';
+  let ext = mediaType.split('/')[1].toLowerCase();
+  if (ext === 'jpeg') ext = 'jpg';
+  if (ext === 'svg+xml') ext = 'svg';
+  return ext.replace(/[^a-z0-9]+/g, '');
+}
+
+function buildCodexInput(message, attachments, workspaceDir) {
+  const attachmentList = Array.isArray(attachments) ? attachments : [];
+  const imageAttachments = [];
+  const nonImageAttachments = [];
+
+  for (const att of attachmentList) {
+    const mediaType = typeof att?.mediaType === 'string' ? att.mediaType : '';
+    const hasData = typeof att?.data === 'string' && att.data.length > 0;
+    if (mediaType.startsWith(IMAGE_MEDIA_PREFIX) && hasData) {
+      imageAttachments.push(att);
+    } else if (att) {
+      nonImageAttachments.push({ att, hasData });
+    }
+  }
+
+  let tempDir;
+  const shouldWriteFiles = imageAttachments.length > 0 || nonImageAttachments.length > 0;
+  if (shouldWriteFiles) {
+    if (workspaceDir && typeof workspaceDir === 'string' && workspaceDir.trim()) {
+      try {
+        tempDir = mkdtempSync(join(workspaceDir, '.codex-attachments-'));
+      } catch (error) {
+        logWarn('ATTACHMENT', 'Failed to create temp dir in workspace, falling back to OS tmp', error?.message || error);
+      }
+    }
+    if (!tempDir) {
+      tempDir = mkdtempSync(join(tmpdir(), 'codex-attachments-'));
+    }
+  }
+
+  const imageEntries = [];
+  const nonImageSaved = [];
+  const nonImageUnsaved = [];
+
+  if (tempDir) {
+    for (const att of imageAttachments) {
+      const ext = getAttachmentExtension(att) || 'png';
+      const filePath = join(tempDir, `attachment-${randomUUID()}.${ext}`);
+      try {
+        const buffer = Buffer.from(att.data, 'base64');
+        writeFileSync(filePath, buffer);
+        imageEntries.push({ type: 'local_image', path: filePath });
+      } catch (error) {
+        logWarn('ATTACHMENT', `Failed to write image attachment: ${filePath}`, error?.message || error);
+      }
+    }
+
+    for (const entry of nonImageAttachments) {
+      const name = getAttachmentName(entry.att);
+      if (!entry.hasData) {
+        nonImageUnsaved.push(name);
+        continue;
+      }
+      const ext = getAttachmentExtension(entry.att) || 'bin';
+      const filePath = join(tempDir, `attachment-${randomUUID()}.${ext}`);
+      try {
+        const buffer = Buffer.from(entry.att.data, 'base64');
+        writeFileSync(filePath, buffer);
+        nonImageSaved.push({ name, path: filePath });
+      } catch (error) {
+        logWarn('ATTACHMENT', `Failed to write attachment: ${filePath}`, error?.message || error);
+        nonImageUnsaved.push(name);
+      }
+    }
+  } else if (nonImageAttachments.length > 0) {
+    for (const entry of nonImageAttachments) {
+      nonImageUnsaved.push(getAttachmentName(entry.att));
+    }
+  }
+
+  let text = message ?? '';
+  const notes = [];
+  if (nonImageSaved.length > 0) {
+    notes.push('Non-image attachments saved to:');
+    for (const entry of nonImageSaved) {
+      notes.push(`- ${entry.name}: ${entry.path}`);
+    }
+  }
+  if (nonImageUnsaved.length > 0) {
+    notes.push(...nonImageUnsaved.map((name) => `[Attachment: ${name}]`));
+  }
+
+  if (notes.length > 0) {
+    text = text.trim() ? `${text}\n\n${notes.join('\n')}` : notes.join('\n');
+  }
+
+  if (!text.trim()) {
+    if (imageEntries.length > 0) {
+      text = `[Uploaded ${imageEntries.length} image(s)]`;
+    } else if (nonImageSaved.length > 0 || nonImageUnsaved.length > 0) {
+      text = '[Uploaded attachment(s)]';
+    } else {
+      text = '[Empty message]';
+    }
+  }
+
+  let cleanup = null;
+  if (tempDir && (imageEntries.length > 0 || nonImageSaved.length > 0)) {
+    cleanup = () => {
+      try {
+        rmSync(tempDir, { recursive: true, force: true });
+      } catch (error) {
+        logWarn('ATTACHMENT', 'Failed to cleanup temp dir', error?.message || error);
+      }
+    };
+  } else if (tempDir) {
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+    } catch (error) {
+      logWarn('ATTACHMENT', 'Failed to cleanup temp dir', error?.message || error);
+    }
+  }
+
+  const input = imageEntries.length > 0 ? [{ type: 'text', text }, ...imageEntries] : text;
+  return { input, cleanup, imageCount: imageEntries.length };
+}
+
 /**
  * Send message to Codex (with optional thread resumption)
  *
@@ -239,6 +377,7 @@ function collectAgentsInstructions(cwd) {
  * @param {string} model - Model name (optional)
  * @param {string} baseUrl - API base URL (optional, for custom endpoints)
  * @param {string} apiKey - API key (optional, for custom auth)
+ * @param {Array} attachments - Attachments list (optional; images sent, non-images saved and referenced)
  */
 export async function sendMessage(
   message,
@@ -248,8 +387,10 @@ export async function sendMessage(
   model = null,
   baseUrl = null,
   apiKey = null,
-  reasoningEffort = 'medium'
+  reasoningEffort = 'medium',
+  attachments = null
 ) {
+  let cleanupAttachments = null;
   try {
     console.log('[DEBUG] Codex sendMessage called with params:', {
       threadId,
@@ -258,7 +399,8 @@ export async function sendMessage(
       model,
       reasoningEffort,
       hasBaseUrl: !!baseUrl,
-      hasApiKey: !!apiKey
+      hasApiKey: !!apiKey,
+      attachmentCount: Array.isArray(attachments) ? attachments.length : 0
     });
 
     console.log('[MESSAGE_START]');
@@ -380,7 +522,13 @@ export async function sendMessage(
     // 6. Execute Streaming Query
     // ============================================================
 
-    const { events } = await thread.runStreamed(finalMessage);
+    const { input, cleanup, imageCount } = buildCodexInput(finalMessage, attachments, cwd);
+    cleanupAttachments = cleanup;
+    if (imageCount > 0) {
+      logInfo('ATTACHMENT', `Prepared ${imageCount} image attachment(s) for Codex`);
+    }
+
+    const { events } = await thread.runStreamed(input);
 
     let currentThreadId = threadId;
     let finalResponse = '';
@@ -938,6 +1086,10 @@ export async function sendMessage(
     const errorPayload = buildErrorPayload(error);
     console.error('[SEND_ERROR]', JSON.stringify(errorPayload));
     console.log(JSON.stringify(errorPayload));
+  } finally {
+    if (cleanupAttachments) {
+      cleanupAttachments();
+    }
   }
 }
 

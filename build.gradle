@@ -80,16 +80,16 @@ dependencies {
     intellijPlatform {
         def targetIde = project.findProperty('targetIde') ?: 'IC'
         if (targetIde == 'PC') {
-            pycharmCommunity('2024.3')
+            pycharmCommunity('2025.2.2')
             bundledPlugin('PythonCore')
         } else if (targetIde == 'PY') {
-            pycharmProfessional('2024.3')
+            pycharmProfessional('2025.2.2')
             bundledPlugin('Pythonid')
         } else {
-            intellijIdeaCommunity('2024.3.1')
+            intellijIdeaCommunity('2025.2.2')
             bundledPlugin('com.intellij.java')
             // Add Python plugin to support compiling PythonContextCollector
-            plugin('PythonCore', '243.22562.145')
+            plugin('PythonCore', '252.26199.169')
             // Enable Terminal Plugin support
             bundledPlugin('org.jetbrains.plugins.terminal')
         }
